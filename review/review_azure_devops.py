@@ -272,16 +272,31 @@ def build_prompt(file_path: str, full_code: str, hunks: List[ChangedHunk], human
             snippet_lines = h.added_lines[:50]
         hunk_snippets.append(f"{h.header}\n" + '\n'.join(snippet_lines))
     human_comment_text = '\n'.join(human_comments) if human_comments else 'None'
-    prompt = (
-        "You are an experienced senior software engineer performing a focused code review. "
-        "Only comment on the changed lines/hunks below. Provide concise, actionable feedback on correctness, security, performance, maintainability, and style. "
-        "If everything in a hunk looks good, respond with 'LGTM for this hunk'. Do not repeat previous human comments.\n\n"
-        f"File: {file_path}\n"
-        f"Total added lines under review: {total_added}\n\n"
-        f"Changed hunks (unified headers + added lines only):\n{chr(10).join(hunk_snippets)}\n\n"
-        f"Relevant prior human comments (avoid duplication):\n{human_comment_text}\n"
-        "Output format: For each hunk, prefix feedback with 'HUNK:' and a short summary. If no issues, state 'HUNK: <summary> - LGTM'."
-    )
+    is_markdown = file_path.lower().endswith('.md')
+    if is_markdown:
+        prompt = (
+            "You are an expert technical editor focused strictly on grammar, clarity, conciseness, tone consistency, and markdown formatting. "
+            "Review ONLY the added '+' lines (surrounding context is provided for reference). Do NOT comment on unchanged context unless it directly affects an added sentence. "
+            "Ignore code-style or implementation details—this is a documentation/markdown quality pass. "
+            "Combine minor nits where reasonable. Avoid repeating human feedback. If a hunk is fine, respond 'LGTM for this hunk'.\n\n"
+            f"File: {file_path}\n"
+            f"Total added lines under review: {total_added}\n\n"
+            f"Changed hunks (headers + context with '+' additions marked):\n{chr(10).join(hunk_snippets)}\n\n"
+            f"Relevant prior human comments (avoid duplication):\n{human_comment_text}\n"
+            "Output format: For each hunk, start a new line with 'HUNK:' followed by either 'LGTM' or a concise list of suggestions. "
+            "For suggestions use bullet style '- original -> improved' or '- suggestion: <text>'. Do not include any preamble before the first HUNK line."
+        )
+    else:
+        prompt = (
+            "You are an experienced senior software engineer performing a focused code review. "
+            "Only comment on the changed '+' lines (context provided). Provide concise, actionable feedback on correctness, security, performance, maintainability, and style. "
+            "If everything in a hunk looks good, respond with 'LGTM for this hunk'. Do not repeat previous human comments.\n\n"
+            f"File: {file_path}\n"
+            f"Total added lines under review: {total_added}\n\n"
+            f"Changed hunks (unified headers + context):\n{chr(10).join(hunk_snippets)}\n\n"
+            f"Relevant prior human comments (avoid duplication):\n{human_comment_text}\n"
+            "Output format: For each hunk, prefix feedback with 'HUNK:' and a short summary. If no issues, state 'HUNK: <summary> - LGTM'."
+        )
     return prompt
 
 def openai_review(client, model: str, prompt: str) -> str:

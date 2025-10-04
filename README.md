@@ -25,6 +25,7 @@ The script `review/review_azure_devops.py` performs automated line-level review 
 * Skips very large files or excessively large diffs to control token usage
 * Per-file failure isolation (optional fail-fast)
 * Dry-run mode for local experimentation
+* Markdown-aware mode: for `.md` files the AI focuses on grammar, clarity, tone, and formatting suggestions only
 
 ### Environment Variables
 Set the following in your pipeline or local shell:
