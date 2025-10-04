@@ -73,6 +73,7 @@ class ChangedHunk:
     removed_start: int
     removed_count: int
     header: str
+    context_block: List[str]  # lines including context (without diff +/- prefixes except we keep '+' for added to highlight)
 
 def run_with_retry(func, retries=3, delay=1.5, backoff=2.0):
     attempt = 0
@@ -96,9 +97,13 @@ def get_pr_commits() -> Tuple[str,str]:
     data = resp.json()
     return data['lastMergeSourceCommit']['commitId'], data['lastMergeTargetCommit']['commitId']
 
-def get_pr_changed_files(base_sha: str, target_sha: str) -> List[str]:
-    # Use diff api
-    diff_url = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/diffs/commits?baseVersion={target_sha}&targetVersion={base_sha}&api-version=7.0"
+def get_pr_changed_files(pr_source_sha: str, pr_target_sha: str) -> List[str]:
+    """Return list of changed file paths in the PR.
+
+    Azure DevOps diff API expects baseVersion=target (e.g., main) and targetVersion=source (PR head) to compute changes introduced.
+    We intentionally maintain the naming alignment with parse_diff_for_file which uses pr_source_sha (head) and pr_target_sha (base).
+    """
+    diff_url = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/diffs/commits?baseVersion={pr_target_sha}&targetVersion={pr_source_sha}&api-version=7.0"
     resp = run_with_retry(lambda: requests.post(diff_url, headers=auth_headers({"Content-Type":"application/json"}), json={}))
     resp.raise_for_status()
     files = []
@@ -132,32 +137,57 @@ def is_probably_text(path: str) -> bool:
             return False
     return False
 
-def parse_diff_for_file(base_sha: str, target_sha: str, file_path: str) -> List[ChangedHunk]:
-    # Get raw unified diff for a file
-    diff_api = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/diffs/commits?baseVersion={target_sha}&targetVersion={base_sha}&$top=1&api-version=7.0&diffCommonCommit=false"
-    # Fall back to local git if available
-    try:
-        import subprocess
-        proc = subprocess.run(['git','show', f'{target_sha}:{file_path}'], capture_output=True, text=True)
-        old_content = proc.stdout if proc.returncode==0 else ''
-        proc2 = subprocess.run(['git','show', f'{base_sha}:{file_path}'], capture_output=True, text=True)
-        new_content = proc2.stdout if proc2.returncode==0 else ''
-    except Exception:
-        old_content = new_content = ''
-    # Simpler approach: use git diff locally for precise hunks
+def parse_diff_for_file(pr_source_sha: str, pr_target_sha: str, file_path: str) -> List[ChangedHunk]:
+    """Parse diff hunks for a single file.
+
+    Parameters:
+      pr_source_sha: The HEAD/source commit of the PR (what is being merged) (aka baseSha in Azure PR object lastMergeSourceCommit)
+      pr_target_sha: The target branch commit (e.g., main) (aka targetSha in Azure PR object lastMergeTargetCommit)
+      file_path: Path to file to diff
+
+    Env:
+      AI_REVIEW_DIFF_MODE: 'two-dot' (default) or 'triple-dot'
+
+    Rationale:
+      We previously used a triple-dot (A...B) diff which produces the diff of merge base vs B. For PR review we typically
+      want the direct change set between target (main) and the PR head. GitHub style comparisons often use three-dot, but
+      local validation / correctness of added lines is clearer with two-dot when the branch is rebased. Allow both.
+    """
+    diff_mode = os.getenv('AI_REVIEW_DIFF_MODE', 'two-dot').strip().lower()
+    if diff_mode not in {'two-dot', 'triple-dot'}:
+        logger.warning("AI_REVIEW_DIFF_MODE '%s' invalid; defaulting to two-dot", diff_mode)
+        diff_mode = 'two-dot'
+
+    # Choose diff ref expression
+    # two-dot: git diff pr_target_sha pr_source_sha => shows changes introduced by PR relative to target branch
+    # triple-dot: git diff pr_target_sha...pr_source_sha => changes since common ancestor (can hide rebased removals/additions semantics differences)
+    ref_expr = f"{pr_target_sha} {'...' if diff_mode == 'triple-dot' else ''} {pr_source_sha}".replace('  ', ' ').strip()
+    # Build argument list without stray spaces
+    if diff_mode == 'triple-dot':
+        diff_args = ['git', 'diff', f'{pr_target_sha}...{pr_source_sha}', '--', file_path]
+    else:
+        diff_args = ['git', 'diff', pr_target_sha, pr_source_sha, '--', file_path]
+
     hunks: List[ChangedHunk] = []
     try:
         import subprocess
-        diff_out = subprocess.run(['git','diff', f'{target_sha}...{base_sha}', '--', file_path], capture_output=True, text=True).stdout
+        diff_out = subprocess.run(diff_args, capture_output=True, text=True).stdout
         current_header = ''
+        current_hunk_all_lines: List[str] = []  # raw lines (with +/-/space prefixes)
         for line in diff_out.splitlines():
             if line.startswith('@@'):
-                # @@ -a,b +c,d @@ optional header
+                # Flush previous hunk lines (if any) into last hunk's context_block
+                if hunks and current_hunk_all_lines:
+                    # finalize previous hunk context
+                    hunks[-1].context_block = _extract_context_block(current_hunk_all_lines, hunks[-1].added_lines, DIFF_CONTEXT_LINES)
+                current_hunk_all_lines = []
                 header = line
                 current_header = header
                 parts = header.split(' ')
-                removed_part = parts[1]  # -a,b
-                added_part = parts[2]    # +c,d
+                if len(parts) < 3:
+                    continue
+                removed_part = parts[1]
+                added_part = parts[2]
                 r_start, r_count = removed_part[1:].split(',') if ',' in removed_part else (removed_part[1:], '1')
                 a_start, a_count = added_part[1:].split(',') if ',' in added_part else (added_part[1:], '1')
                 hunks.append(ChangedHunk(
@@ -166,13 +196,45 @@ def parse_diff_for_file(base_sha: str, target_sha: str, file_path: str) -> List[
                     added_lines=[],
                     removed_start=int(r_start),
                     removed_count=int(r_count),
-                    header=current_header
+                    header=current_header,
+                    context_block=[]
                 ))
             elif line.startswith('+') and not line.startswith('+++') and hunks:
                 hunks[-1].added_lines.append(line[1:])
+                current_hunk_all_lines.append(line)
+            elif (line.startswith(' ') or line.startswith('-')) and not line.startswith('---') and hunks:
+                current_hunk_all_lines.append(line)
+        # finalize last hunk
+        if hunks and current_hunk_all_lines:
+            hunks[-1].context_block = _extract_context_block(current_hunk_all_lines, hunks[-1].added_lines, DIFF_CONTEXT_LINES)
     except Exception as e:
-        logger.warning("Failed to parse diff for %s: %s", file_path, e)
+        logger.warning("Failed to parse diff for %s (%s mode): %s", file_path, diff_mode, e)
     return hunks
+
+def _extract_context_block(raw_hunk_lines: List[str], added_lines: List[str], context_lines: int) -> List[str]:
+    """Return a subset of the hunk including context_lines around added lines.
+
+    raw_hunk_lines: lines with original diff prefixes ('+','-',' ') excluding the @@ header.
+    We collect indices of added lines then expand by context_lines in both directions.
+    Removed lines are retained only if within the selected window; we strip leading space prefix for neutral lines and keep '+' for added, '-' for removed.
+    """
+    if not added_lines:
+        return []
+    # Identify positions of added lines in raw_hunk_lines
+    added_positions = [i for i,l in enumerate(raw_hunk_lines) if l.startswith('+')]
+    if not added_positions:
+        return []
+    start = max(0, min(added_positions) - context_lines)
+    end = min(len(raw_hunk_lines), max(added_positions) + context_lines + 1)
+    window = raw_hunk_lines[start:end]
+    # Normalize: remove leading space for context lines to reduce tokens
+    normalized = []
+    for l in window:
+        if l.startswith(' '):
+            normalized.append(l[1:])
+        else:
+            normalized.append(l)
+    return normalized
 
 # Review code using Azure OpenAI
 
@@ -203,8 +265,12 @@ def build_prompt(file_path: str, full_code: str, hunks: List[ChangedHunk], human
     hunk_snippets = []
     total_added = sum(len(h.added_lines) for h in hunks)
     for h in hunks:
-        context_block = '\n'.join(h.added_lines[:50])  # cap lines per hunk portion
-        hunk_snippets.append(f"{h.header}\n{context_block}")
+        # Prefer context block if available; fallback to added lines only
+        if h.context_block:
+            snippet_lines = h.context_block[: 100]  # simple cap
+        else:
+            snippet_lines = h.added_lines[:50]
+        hunk_snippets.append(f"{h.header}\n" + '\n'.join(snippet_lines))
     human_comment_text = '\n'.join(human_comments) if human_comments else 'None'
     prompt = (
         "You are an experienced senior software engineer performing a focused code review. "
@@ -311,7 +377,7 @@ def close_outdated_ai_threads(ai_threads: List[dict], current_added_lines: set):
             payload = {"status": 2}
             run_with_retry(lambda: requests.patch(url, headers=auth_headers({"Content-Type":"application/json"}), json=payload))
 
-def review_file(client, model: str, base_sha: str, target_sha: str, file_path: str, threads: List[dict], dry_run: bool=False):
+def review_file(client, model: str, pr_source_sha: str, pr_target_sha: str, file_path: str, threads: List[dict], dry_run: bool=False):
     fail_fast = os.getenv('AI_REVIEW_FAIL_FAST', 'false').lower() in {'1','true','yes'}
     try:
         if not os.path.exists(file_path):
@@ -323,7 +389,7 @@ def review_file(client, model: str, base_sha: str, target_sha: str, file_path: s
             return
         with open(file_path,'r', encoding='utf-8', errors='replace') as f:
             full_code = f.read()
-        hunks = parse_diff_for_file(base_sha, target_sha, file_path)
+        hunks = parse_diff_for_file(pr_source_sha, pr_target_sha, file_path)
         if not hunks:
             logger.info("No hunks parsed for %s", file_path)
             return
@@ -385,9 +451,9 @@ def main():
         sys.exit(2)
     client = OpenAI(api_key=api_key)
     model_name = os.getenv('OPENAI_MODEL')
-    base_sha, target_sha = get_pr_commits()
-    logger.info("Base (source) commit: %s Target (main) commit: %s", base_sha[:8], target_sha[:8])
-    files = get_pr_changed_files(base_sha, target_sha)
+    pr_source_sha, pr_target_sha = get_pr_commits()
+    logger.info("PR source (head) commit: %s Target (base) commit: %s", pr_source_sha[:8], pr_target_sha[:8])
+    files = get_pr_changed_files(pr_source_sha, pr_target_sha)
     logger.info("Changed files (raw): %s", files)
     text_files = [f for f in files if is_probably_text(f)]
     skipped = set(files) - set(text_files)
@@ -397,7 +463,7 @@ def main():
     threads = fetch_existing_threads()
     for fp in text_files:
         try:
-            review_file(client, model_name, base_sha, target_sha, fp, threads, dry_run=args.dry_run)
+            review_file(client, model_name, pr_source_sha, pr_target_sha, fp, threads, dry_run=args.dry_run)
         except Exception as e:
             logger.error("Failed reviewing %s: %s", fp, e)
 

@@ -1,0 +1,48 @@
+# Minimal AI Code Review pipeline for Azure DevOps
+# Runs only on Pull Requests targeting main. Adjust branches as needed.
+# Place secrets (OPENAI_API_KEY, AZURE_DEVOPS_PAT) in secure variable storage.
+
+trigger: none
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  OPENAI_MODEL: gpt-4o-mini
+  AI_REVIEW_DIFF_MODE: two-dot
+
+steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.11'
+    displayName: Use Python 3.11
+
+  - script: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+    displayName: Install dependencies
+
+  - script: |
+      echo "Running AI code review..."
+      python review/review_azure_devops.py
+    env:
+      AZURE_DEVOPS_ORG: $(System.TeamFoundationCollectionUri)
+      AZURE_DEVOPS_PROJECT: $(System.TeamProject)
+      AZURE_DEVOPS_PR_ID: $(System.PullRequest.PullRequestId)
+      AZURE_DEVOPS_REPO_ID: $(Build.Repository.ID)
+      AZURE_DEVOPS_PAT: $(AZURE_DEVOPS_PAT)
+      OPENAI_API_KEY: $(OPENAI_API_KEY)
+      OPENAI_MODEL: $(OPENAI_MODEL)
+      AI_REVIEW_DIFF_MODE: $(AI_REVIEW_DIFF_MODE)
+      # Optional tuning
+      # OPENAI_MAX_RETRIES: 6
+      # OPENAI_BASE_DELAY: 1.2
+      # OPENAI_FALLBACK_MODEL: gpt-4o
+      # OPENAI_RETRY_JITTER: 0.4
+      # AI_REVIEW_FAIL_FAST: 'true'
+    displayName: Run AI PR Review
+    condition: eq(variables['Build.Reason'], 'PullRequest')
