@@ -26,6 +26,8 @@ The script `review/review_azure_devops.py` performs automated line-level review 
 * Per-file failure isolation (optional fail-fast)
 * Dry-run mode for local experimentation
 * Markdown-aware mode: for `.md` files the AI focuses on grammar, clarity, tone, and formatting suggestions only
+* C code awareness: for `.c` / `.h` files emphasizes MISRA C guideline adherence, memory safety, undefined behavior, concurrency/race risks, security vulnerabilities, and obvious typos in comments/identifiers (with severity tagging)
+* Aggregated severity summary: posts a final PR-level comment with counts per severity (can disable via `AI_REVIEW_SUMMARY=false`)
 
 ### Environment Variables
 Set the following in your pipeline or local shell:
@@ -49,6 +51,7 @@ OPENAI_RETRY_JITTER      # optional; default 0.25 seconds
 # Review behavior
 AI_REVIEW_FAIL_FAST      # true/1 to abort entire run on first file error
 AI_REVIEW_DIFF_MODE      # two-dot (default) or triple-dot
+AI_REVIEW_SUMMARY        # true/false (default true) to enable final severity summary comment
 ```
 
 ### Local Dry Run

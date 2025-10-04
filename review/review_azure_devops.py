@@ -272,7 +272,9 @@ def build_prompt(file_path: str, full_code: str, hunks: List[ChangedHunk], human
             snippet_lines = h.added_lines[:50]
         hunk_snippets.append(f"{h.header}\n" + '\n'.join(snippet_lines))
     human_comment_text = '\n'.join(human_comments) if human_comments else 'None'
-    is_markdown = file_path.lower().endswith('.md')
+    lower_path = file_path.lower()
+    is_markdown = lower_path.endswith('.md')
+    is_c = lower_path.endswith('.c') or lower_path.endswith('.h')
     if is_markdown:
         prompt = (
             "You are an expert technical editor focused strictly on grammar, clarity, conciseness, tone consistency, and markdown formatting. "
@@ -285,6 +287,21 @@ def build_prompt(file_path: str, full_code: str, hunks: List[ChangedHunk], human
             f"Relevant prior human comments (avoid duplication):\n{human_comment_text}\n"
             "Output format: For each hunk, start a new line with 'HUNK:' followed by either 'LGTM' or a concise list of suggestions. "
             "For suggestions use bullet style '- original -> improved' or '- suggestion: <text>'. Do not include any preamble before the first HUNK line."
+        )
+    elif is_c:
+        prompt = (
+            "You are an expert embedded/C systems reviewer. Evaluate ONLY the added '+' lines (context shown) with focus on: MISRA C (latest edition) guideline adherence, "
+            "memory safety, undefined/implementation-defined behavior, integer overflow, pointer misuse, resource leaks, concurrency/race conditions, security vulnerabilities (e.g., buffer overflows, injection, UB), and obvious typos or spelling mistakes in comments or newly introduced identifiers (flag only if clarity or maintainability is impacted). "
+            "If a guideline is violated, cite it briefly (e.g., 'MISRA Dir 4.1' or 'MISRA Rule 17.7') without lengthy quotation. "
+            "If everything in a hunk is acceptable, respond 'LGTM for this hunk'. "
+            "Do NOT repeat human comments or comment on lines not changed unless directly required to explain a defect.\n\n"
+            f"File: {file_path}\n"
+            f"Total added lines under review: {total_added}\n\n"
+            f"Changed hunks (headers + context; '+' indicates new code):\n{chr(10).join(hunk_snippets)}\n\n"
+            f"Relevant prior human comments (avoid duplication):\n{human_comment_text}\n"
+            "Output format: For each hunk, start with 'HUNK:' then zero or more issue bullets of the form '- [SEVERITY] Category: description (optional rule/ref)'. "
+            "Severity must be one of: CRITICAL, HIGH, MEDIUM, LOW, INFO. If no issues: 'HUNK: <summary> - LGTM'. "
+            "Categories examples: Memory, Concurrency, UndefinedBehavior, Style, Portability, Security. Keep each bullet concise."
         )
     else:
         prompt = (
@@ -392,7 +409,7 @@ def close_outdated_ai_threads(ai_threads: List[dict], current_added_lines: set):
             payload = {"status": 2}
             run_with_retry(lambda: requests.patch(url, headers=auth_headers({"Content-Type":"application/json"}), json=payload))
 
-def review_file(client, model: str, pr_source_sha: str, pr_target_sha: str, file_path: str, threads: List[dict], dry_run: bool=False):
+def review_file(client, model: str, pr_source_sha: str, pr_target_sha: str, file_path: str, threads: List[dict], dry_run: bool=False, severity_totals: Optional[Dict[str,int]] = None):
     fail_fast = os.getenv('AI_REVIEW_FAIL_FAST', 'false').lower() in {'1','true','yes'}
     try:
         if not os.path.exists(file_path):
@@ -440,6 +457,13 @@ def review_file(client, model: str, pr_source_sha: str, pr_target_sha: str, file
                 logger.info("(Dry-run) Would comment on %s line %d:\n%s", file_path, anchor_line, fb)
             else:
                 post_review_comment(file_path, fb, line=anchor_line)
+            # Aggregate severity counts if present and we are in C mode or generic; regex parse [SEVERITY]
+            if severity_totals is not None:
+                for line in fb.splitlines():
+                    if line.startswith('- [') and ']' in line:
+                        sev_token = line[3: line.find(']')].strip().upper()
+                        if sev_token in {"CRITICAL","HIGH","MEDIUM","LOW","INFO"}:
+                            severity_totals[sev_token] = severity_totals.get(sev_token, 0) + 1
         if not dry_run:
             close_outdated_ai_threads(ai_threads, added_line_numbers)
     except Exception as e:
@@ -476,11 +500,24 @@ def main():
         logger.info("Skipping non-text files: %s", sorted(skipped))
     logger.info("Text files to review: %s", text_files)
     threads = fetch_existing_threads()
+    severity_totals: Dict[str,int] = {}
+    summary_enabled = os.getenv('AI_REVIEW_SUMMARY', 'true').lower() in {'1','true','yes','on'}
     for fp in text_files:
         try:
-            review_file(client, model_name, pr_source_sha, pr_target_sha, fp, threads, dry_run=args.dry_run)
+            review_file(client, model_name, pr_source_sha, pr_target_sha, fp, threads, dry_run=args.dry_run, severity_totals=severity_totals if summary_enabled else None)
         except Exception as e:
             logger.error("Failed reviewing %s: %s", fp, e)
+    # Post summary comment if enabled and not dry-run
+    if summary_enabled and not args.dry_run:
+        total_comments = sum(severity_totals.values())
+        if total_comments:
+            # Build summary body
+            ordered = [f"{k}: {severity_totals[k]}" for k in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"] if k in severity_totals]
+            summary_lines = ["AI Review Summary (severity counts across C/security analysis):", *ordered]
+            body = '\n'.join(summary_lines)
+            post_review_comment("PR_SUMMARY", body, line=None)
+        else:
+            logger.info("No severity-tagged issues detected; skipping summary comment.")
 
 if __name__ == '__main__':
     try:
