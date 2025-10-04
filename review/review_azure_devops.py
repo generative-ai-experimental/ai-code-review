@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import random
 import base64
 import logging
 import argparse
@@ -10,13 +11,22 @@ from typing import List, Optional, Dict, Tuple
 import mimetypes
 
 import requests
-import openai
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 AI_COMMENT_TAG = "[AI Review]"
 EXCLUDE_FOLDERS = {'.github', 'review'}
 MAX_FILE_BYTES = 60_000  # guard against very large files
 MAX_CHANGED_LINES = 800   # skip overly large diffs to control token usage
 DIFF_CONTEXT_LINES = 3
+
+# Optional environment variables for tuning OpenAI retry behavior:
+#   OPENAI_MAX_RETRIES      (int, default 5)
+#   OPENAI_BASE_DELAY       (float seconds, default 1.0)
+#   OPENAI_FALLBACK_MODEL   (string model name; switches after half the retries fail)
+#   OPENAI_RETRY_JITTER     (float seconds max random jitter, default 0.25)
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
 logger = logging.getLogger("ai_code_review")
@@ -208,20 +218,71 @@ def build_prompt(file_path: str, full_code: str, hunks: List[ChangedHunk], human
     )
     return prompt
 
-def openai_review(model: str, prompt: str) -> str:
-    try:
-        completion = openai.ChatCompletion.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a precise senior code reviewer."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=900
-        )
-        return completion['choices'][0]['message']['content'].strip()
-    except Exception as e:
-        raise RuntimeError(f"OpenAI chat completion failed: {e}")
+def openai_review(client, model: str, prompt: str) -> str:
+    """Call OpenAI chat completion with advanced retry/backoff & optional fallback.
+
+    Env vars (optional):
+      OPENAI_MAX_RETRIES: int (default 5)
+      OPENAI_BASE_DELAY: float seconds (default 1.0)
+      OPENAI_FALLBACK_MODEL: model name to switch to mid-way if primary failing
+      OPENAI_RETRY_JITTER: float max random jitter seconds (default 0.25)
+    """
+    max_retries = int(os.getenv('OPENAI_MAX_RETRIES', '5'))
+    base_delay = float(os.getenv('OPENAI_BASE_DELAY', '1.0'))
+    fallback_model = os.getenv('OPENAI_FALLBACK_MODEL')
+    jitter_cap = float(os.getenv('OPENAI_RETRY_JITTER', '0.25'))
+    using_fallback = False
+
+    def should_retry(status_code: Optional[int]) -> bool:
+        if status_code is None:
+            return True  # network / unknown
+        return status_code in {408, 409, 429, 500, 502, 503, 504}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a precise senior code reviewer."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=900
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as e:
+            # Attempt to introspect error shape (OpenAI python client may change)
+            status_code = getattr(e, 'status_code', None)
+            retry_after = None
+            if hasattr(e, 'response') and getattr(e, 'response') is not None:
+                try:
+                    status_code = getattr(e.response, 'status_code', status_code)
+                    rh = getattr(e.response, 'headers', {}) or {}
+                    retry_after = rh.get('Retry-After') or rh.get('retry-after')
+                except Exception:
+                    pass
+
+            if not should_retry(status_code):
+                raise RuntimeError(f"Non-retriable OpenAI error (status={status_code}): {e}")
+
+            if attempt == (max_retries // 2) and fallback_model and not using_fallback:
+                logger.warning("Switching to fallback model '%s' after %d failed attempts of '%s'", fallback_model, attempt, model)
+                model = fallback_model
+                using_fallback = True
+
+            if attempt == max_retries:
+                raise RuntimeError(f"OpenAI chat completion failed after {max_retries} retries: {e}")
+
+            if retry_after:
+                try:
+                    delay = min(float(retry_after), 60.0)
+                except ValueError:
+                    delay = base_delay * (2 ** (attempt - 1))
+            else:
+                delay = base_delay * (2 ** (attempt - 1))
+            delay += random.uniform(0, jitter_cap)
+            logger.warning("OpenAI request failed (attempt %d/%d, status=%s, fallback=%s): %s; retrying in %.2fs", attempt, max_retries, status_code, using_fallback, e, delay)
+            time.sleep(delay)
 
 def post_review_comment(file_path: str, comment: str, line: Optional[int]=None):
     body = f"{AI_COMMENT_TAG} {comment}" if AI_COMMENT_TAG not in comment else comment
@@ -250,55 +311,60 @@ def close_outdated_ai_threads(ai_threads: List[dict], current_added_lines: set):
             payload = {"status": 2}
             run_with_retry(lambda: requests.patch(url, headers=auth_headers({"Content-Type":"application/json"}), json=payload))
 
-def review_file(model: str, base_sha: str, target_sha: str, file_path: str, threads: List[dict], dry_run: bool=False):
-    if not os.path.exists(file_path):
-        logger.info("File %s no longer exists locally; skipping", file_path)
-        return
-    size = os.path.getsize(file_path)
-    if size > MAX_FILE_BYTES:
-        logger.info("Skipping %s (size %d > limit)", file_path, size)
-        return
-    with open(file_path,'r', encoding='utf-8', errors='replace') as f:
-        full_code = f.read()
-    hunks = parse_diff_for_file(base_sha, target_sha, file_path)
-    if not hunks:
-        logger.info("No hunks parsed for %s", file_path)
-        return
-    total_added = sum(len(h.added_lines) for h in hunks)
-    if total_added > MAX_CHANGED_LINES:
-        logger.info("Skipping %s (added lines %d > limit)", file_path, total_added)
-        return
-    human_comments, ai_threads = collect_existing_comments(threads, file_path)
-    prompt = build_prompt(file_path, full_code, hunks, human_comments)
-    ai_text = openai_review(model, prompt)
-    # Split feedback by hunk markers
-    feedback_lines = [l for l in ai_text.splitlines() if l.strip()]
-    # Map each hunk to first feedback line containing 'HUNK:' sequentially
-    hunk_feedback: List[Tuple[ChangedHunk, str]] = []
-    fi = 0
-    for h in hunks:
-        fb = []
-        while fi < len(feedback_lines):
-            line = feedback_lines[fi]
-            if line.startswith('HUNK:') and fb:
-                break
-            fb.append(line)
-            fi += 1
-            if line.startswith('HUNK:') and len(fb) == 1:
-                # continue collecting until next HUNK or end
-                continue
-        hunk_feedback.append((h, '\n'.join(fb)))
-    added_line_numbers = set()
-    for h, fb in hunk_feedback:
-        # choose first added line as anchor
-        anchor_line = h.added_start
-        added_line_numbers.update(range(h.added_start, h.added_start + len(h.added_lines)))
-        if dry_run:
-            logger.info("(Dry-run) Would comment on %s line %d:\n%s", file_path, anchor_line, fb)
-        else:
-            post_review_comment(file_path, fb, line=anchor_line)
-    if not dry_run:
-        close_outdated_ai_threads(ai_threads, added_line_numbers)
+def review_file(client, model: str, base_sha: str, target_sha: str, file_path: str, threads: List[dict], dry_run: bool=False):
+    fail_fast = os.getenv('AI_REVIEW_FAIL_FAST', 'false').lower() in {'1','true','yes'}
+    try:
+        if not os.path.exists(file_path):
+            logger.info("File %s no longer exists locally; skipping", file_path)
+            return
+        size = os.path.getsize(file_path)
+        if size > MAX_FILE_BYTES:
+            logger.info("Skipping %s (size %d > limit)", file_path, size)
+            return
+        with open(file_path,'r', encoding='utf-8', errors='replace') as f:
+            full_code = f.read()
+        hunks = parse_diff_for_file(base_sha, target_sha, file_path)
+        if not hunks:
+            logger.info("No hunks parsed for %s", file_path)
+            return
+        total_added = sum(len(h.added_lines) for h in hunks)
+        if total_added > MAX_CHANGED_LINES:
+            logger.info("Skipping %s (added lines %d > limit)", file_path, total_added)
+            return
+        human_comments, ai_threads = collect_existing_comments(threads, file_path)
+        prompt = build_prompt(file_path, full_code, hunks, human_comments)
+        ai_text = openai_review(client, model, prompt)
+        # Split feedback by hunk markers
+        feedback_lines = [l for l in ai_text.splitlines() if l.strip()]
+        # Map each hunk to first feedback line containing 'HUNK:' sequentially
+        hunk_feedback: List[Tuple[ChangedHunk, str]] = []
+        fi = 0
+        for h in hunks:
+            fb = []
+            while fi < len(feedback_lines):
+                line = feedback_lines[fi]
+                if line.startswith('HUNK:') and fb:
+                    break
+                fb.append(line)
+                fi += 1
+                if line.startswith('HUNK:') and len(fb) == 1:
+                    # continue collecting until next HUNK or end
+                    continue
+            hunk_feedback.append((h, '\n'.join(fb)))
+        added_line_numbers = set()
+        for h, fb in hunk_feedback:
+            anchor_line = h.added_start
+            added_line_numbers.update(range(h.added_start, h.added_start + len(h.added_lines)))
+            if dry_run:
+                logger.info("(Dry-run) Would comment on %s line %d:\n%s", file_path, anchor_line, fb)
+            else:
+                post_review_comment(file_path, fb, line=anchor_line)
+        if not dry_run:
+            close_outdated_ai_threads(ai_threads, added_line_numbers)
+    except Exception as e:
+        logger.error("Error processing file %s: %s", file_path, e, exc_info=True)
+        if fail_fast:
+            raise
 
 # Post review comments to Azure DevOps
 
@@ -310,11 +376,14 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Do not post comments; just log intended actions')
     args = parser.parse_args()
     ensure_env()
-    openai_api_key = os.getenv('OPENAI_API_KEY')
-    if not openai_api_key:
+    if OpenAI is None:
+        logger.error("openai library (>=1.x) not installed. Please add 'openai' to requirements.")
+        sys.exit(2)
+    api_key = os.getenv('OPENAI_API_KEY')
+    if not api_key:
         logger.error("OPENAI_API_KEY not set")
         sys.exit(2)
-    openai.api_key = openai_api_key
+    client = OpenAI(api_key=api_key)
     model_name = os.getenv('OPENAI_MODEL')
     base_sha, target_sha = get_pr_commits()
     logger.info("Base (source) commit: %s Target (main) commit: %s", base_sha[:8], target_sha[:8])
@@ -327,7 +396,10 @@ def main():
     logger.info("Text files to review: %s", text_files)
     threads = fetch_existing_threads()
     for fp in text_files:
-        review_file(model_name, base_sha, target_sha, fp, threads, dry_run=args.dry_run)
+        try:
+            review_file(client, model_name, base_sha, target_sha, fp, threads, dry_run=args.dry_run)
+        except Exception as e:
+            logger.error("Failed reviewing %s: %s", fp, e)
 
 if __name__ == '__main__':
     try:
