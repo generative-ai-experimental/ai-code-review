@@ -3,7 +3,6 @@ import sys
 import json
 import time
 import random
-import base64
 import logging
 import argparse
 from dataclasses import dataclass
@@ -11,13 +10,18 @@ from typing import List, Optional, Dict, Tuple
 import mimetypes
 
 import requests
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
+from .openai_client import create_openai_client, openai_review
+from .azure_devops_api import (
+    ensure_env,
+    get_pr_commits,
+    get_pr_changed_files,
+    fetch_existing_threads,
+    collect_existing_comments,
+    post_review_comment,
+    close_outdated_ai_threads,
+    AI_COMMENT_TAG,
+)
 
-AI_COMMENT_TAG = "[AI Review]"
-EXCLUDE_FOLDERS = {'.github', 'review'}
 MAX_FILE_BYTES = 60_000  # guard against very large files
 MAX_CHANGED_LINES = 800   # skip overly large diffs to control token usage
 DIFF_CONTEXT_LINES = 3
@@ -31,39 +35,7 @@ DIFF_CONTEXT_LINES = 3
 logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
 logger = logging.getLogger("ai_code_review")
 
-# Get PR info from environment variables (set by Azure DevOps)
-AZURE_DEVOPS_ORG = os.getenv('AZURE_DEVOPS_ORG')
-AZURE_DEVOPS_PROJECT = os.getenv('AZURE_DEVOPS_PROJECT')
-AZURE_DEVOPS_PR_ID = os.getenv('AZURE_DEVOPS_PR_ID')
-AZURE_DEVOPS_REPO_ID = os.getenv('AZURE_DEVOPS_REPO_ID')
-AZURE_DEVOPS_PAT = os.getenv('AZURE_DEVOPS_PAT')  # optional if using pre-built basic token
-AZURE_DEVOPS_AUTH_B64 = os.getenv('AZURE_DEVOPS_AUTH')  # pre-encoded basic auth (username:pat -> base64)
-
-def ensure_env():
-    required = [
-        ('AZURE_DEVOPS_ORG', AZURE_DEVOPS_ORG),
-        ('AZURE_DEVOPS_PROJECT', AZURE_DEVOPS_PROJECT),
-        ('AZURE_DEVOPS_PR_ID', AZURE_DEVOPS_PR_ID),
-        ('AZURE_DEVOPS_REPO_ID', AZURE_DEVOPS_REPO_ID),
-        ('OPENAI_MODEL', os.getenv('OPENAI_MODEL')),
-    ]
-    missing = [k for k,v in required if not v]
-    if missing:
-        logger.error("Missing required environment variables: %s", ', '.join(missing))
-        sys.exit(2)
-    global AZURE_DEVOPS_AUTH_B64
-    if not AZURE_DEVOPS_AUTH_B64 and AZURE_DEVOPS_PAT:
-        # Azure DevOps Basic auth uses :PAT as user:pass pair
-        AZURE_DEVOPS_AUTH_B64 = base64.b64encode(f":{AZURE_DEVOPS_PAT}".encode()).decode()
-    if not AZURE_DEVOPS_AUTH_B64:
-        logger.error("Provide either AZURE_DEVOPS_AUTH (base64 basic token) or AZURE_DEVOPS_PAT.")
-        sys.exit(2)
-
-def auth_headers(extra: Optional[Dict[str,str]] = None) -> Dict[str,str]:
-    h = {"Authorization": f"Basic {AZURE_DEVOPS_AUTH_B64}"}
-    if extra:
-        h.update(extra)
-    return h
+## Azure DevOps environment helpers moved to azure_devops_api module
 
 @dataclass
 class ChangedHunk:
@@ -75,45 +47,11 @@ class ChangedHunk:
     header: str
     context_block: List[str]  # lines including context (without diff +/- prefixes except we keep '+' for added to highlight)
 
-def run_with_retry(func, retries=3, delay=1.5, backoff=2.0):
-    attempt = 0
-    while True:
-        try:
-            return func()
-        except Exception as e:  # broad for pipeline resilience
-            attempt += 1
-            if attempt > retries:
-                raise
-            time.sleep(delay)
-            delay *= backoff
-            logger.warning("Retrying after error: %s", e)
+## run_with_retry moved to azure_devops_api
 
 # Fetch changed files in PR
 
-def get_pr_commits() -> Tuple[str,str]:
-    url = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/pullRequests/{AZURE_DEVOPS_PR_ID}?api-version=7.0"
-    resp = run_with_retry(lambda: requests.get(url, headers=auth_headers()))
-    resp.raise_for_status()
-    data = resp.json()
-    return data['lastMergeSourceCommit']['commitId'], data['lastMergeTargetCommit']['commitId']
-
-def get_pr_changed_files(pr_source_sha: str, pr_target_sha: str) -> List[str]:
-    """Return list of changed file paths in the PR.
-
-    Azure DevOps diff API expects baseVersion=target (e.g., main) and targetVersion=source (PR head) to compute changes introduced.
-    We intentionally maintain the naming alignment with parse_diff_for_file which uses pr_source_sha (head) and pr_target_sha (base).
-    """
-    diff_url = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/diffs/commits?baseVersion={pr_target_sha}&targetVersion={pr_source_sha}&api-version=7.0"
-    resp = run_with_retry(lambda: requests.post(diff_url, headers=auth_headers({"Content-Type":"application/json"}), json={}))
-    resp.raise_for_status()
-    files = []
-    for change in resp.json().get('changes', []):
-        item = change.get('item') or {}
-        if item.get('gitObjectType') == 'blob':
-            path = item.get('path','').lstrip('/')
-            if path and not any(path.startswith(folder + '/') for folder in EXCLUDE_FOLDERS):
-                files.append(path)
-    return files
+## get_pr_commits and get_pr_changed_files moved
 
 TEXT_EXTENSIONS = {
     '.c','.h','.cpp','.hpp','.cc','.py','.js','.ts','.tsx','.jsx','.json','.md','.txt','.yml','.yaml','.xml','.html','.css','.scss','.ini','.cfg','.conf','.toml','.sh','.bash','.zsh','.gitignore','.dockerfile','Dockerfile','Makefile'
@@ -238,28 +176,7 @@ def _extract_context_block(raw_hunk_lines: List[str], added_lines: List[str], co
 
 # Review code using Azure OpenAI
 
-def fetch_existing_threads() -> List[dict]:
-    url = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/pullRequests/{AZURE_DEVOPS_PR_ID}/threads?api-version=7.0"
-    resp = run_with_retry(lambda: requests.get(url, headers=auth_headers()))
-    resp.raise_for_status()
-    return resp.json().get('value', [])
-
-def collect_existing_comments(threads, file_path: str) -> Tuple[List[str], List[dict]]:
-    human_comments = []
-    ai_threads = []
-    for thread in threads:
-        context = thread.get('threadContext', {})
-        if context.get('filePath','').lstrip('/') == file_path:
-            is_ai = False
-            for c in thread.get('comments', []):
-                content = c.get('content','')
-                if AI_COMMENT_TAG in content:
-                    is_ai = True
-                else:
-                    human_comments.append(content)
-            if is_ai:
-                ai_threads.append(thread)
-    return human_comments, ai_threads
+## fetch_existing_threads and collect_existing_comments moved
 
 def build_prompt(file_path: str, full_code: str, hunks: List[ChangedHunk], human_comments: List[str]) -> str:
     hunk_snippets = []
@@ -316,98 +233,11 @@ def build_prompt(file_path: str, full_code: str, hunks: List[ChangedHunk], human
         )
     return prompt
 
-def openai_review(client, model: str, prompt: str) -> str:
-    """Call OpenAI chat completion with advanced retry/backoff & optional fallback.
+## OpenAI review logic moved to openai_client.py (create_openai_client, openai_review)
 
-    Env vars (optional):
-      OPENAI_MAX_RETRIES: int (default 5)
-      OPENAI_BASE_DELAY: float seconds (default 1.0)
-      OPENAI_FALLBACK_MODEL: model name to switch to mid-way if primary failing
-      OPENAI_RETRY_JITTER: float max random jitter seconds (default 0.25)
-    """
-    max_retries = int(os.getenv('OPENAI_MAX_RETRIES', '5'))
-    base_delay = float(os.getenv('OPENAI_BASE_DELAY', '1.0'))
-    fallback_model = os.getenv('OPENAI_FALLBACK_MODEL')
-    jitter_cap = float(os.getenv('OPENAI_RETRY_JITTER', '0.25'))
-    using_fallback = False
+## post_review_comment moved
 
-    def should_retry(status_code: Optional[int]) -> bool:
-        if status_code is None:
-            return True  # network / unknown
-        return status_code in {408, 409, 429, 500, 502, 503, 504}
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a precise senior code reviewer."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=900
-            )
-            return completion.choices[0].message.content.strip()
-        except Exception as e:
-            # Attempt to introspect error shape (OpenAI python client may change)
-            status_code = getattr(e, 'status_code', None)
-            retry_after = None
-            if hasattr(e, 'response') and getattr(e, 'response') is not None:
-                try:
-                    status_code = getattr(e.response, 'status_code', status_code)
-                    rh = getattr(e.response, 'headers', {}) or {}
-                    retry_after = rh.get('Retry-After') or rh.get('retry-after')
-                except Exception:
-                    pass
-
-            if not should_retry(status_code):
-                raise RuntimeError(f"Non-retriable OpenAI error (status={status_code}): {e}")
-
-            if attempt == (max_retries // 2) and fallback_model and not using_fallback:
-                logger.warning("Switching to fallback model '%s' after %d failed attempts of '%s'", fallback_model, attempt, model)
-                model = fallback_model
-                using_fallback = True
-
-            if attempt == max_retries:
-                raise RuntimeError(f"OpenAI chat completion failed after {max_retries} retries: {e}")
-
-            if retry_after:
-                try:
-                    delay = min(float(retry_after), 60.0)
-                except ValueError:
-                    delay = base_delay * (2 ** (attempt - 1))
-            else:
-                delay = base_delay * (2 ** (attempt - 1))
-            delay += random.uniform(0, jitter_cap)
-            logger.warning("OpenAI request failed (attempt %d/%d, status=%s, fallback=%s): %s; retrying in %.2fs", attempt, max_retries, status_code, using_fallback, e, delay)
-            time.sleep(delay)
-
-def post_review_comment(file_path: str, comment: str, line: Optional[int]=None):
-    body = f"{AI_COMMENT_TAG} {comment}" if AI_COMMENT_TAG not in comment else comment
-    thread_context = {"filePath": f"/{file_path}"}
-    if line:
-        thread_context["rightFileStart"] = {"line": line}
-        thread_context["rightFileEnd"] = {"line": line}
-    payload = {
-        "comments": [{"parentCommentId": 0, "content": body, "commentType": 1}],
-        "status": 1,
-        "threadContext": thread_context
-    }
-    url = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/pullRequests/{AZURE_DEVOPS_PR_ID}/threads?api-version=7.0"
-    resp = run_with_retry(lambda: requests.post(url, headers=auth_headers({"Content-Type":"application/json"}), json=payload))
-    if not (200 <= resp.status_code < 300):
-        logger.warning("Failed to post comment for %s: %s", file_path, resp.text)
-
-def close_outdated_ai_threads(ai_threads: List[dict], current_added_lines: set):
-    for thread in ai_threads:
-        thread_id = thread.get('id')
-        context = thread.get('threadContext', {})
-        start = context.get('rightFileStart', {}).get('line')
-        if start and start not in current_added_lines:
-            # close
-            url = f"https://dev.azure.com/{AZURE_DEVOPS_ORG}/{AZURE_DEVOPS_PROJECT}/_apis/git/repositories/{AZURE_DEVOPS_REPO_ID}/pullRequests/{AZURE_DEVOPS_PR_ID}/threads/{thread_id}?api-version=7.0"
-            payload = {"status": 2}
-            run_with_retry(lambda: requests.patch(url, headers=auth_headers({"Content-Type":"application/json"}), json=payload))
+## close_outdated_ai_threads moved
 
 def review_file(client, model: str, pr_source_sha: str, pr_target_sha: str, file_path: str, threads: List[dict], dry_run: bool=False, severity_totals: Optional[Dict[str,int]] = None):
     fail_fast = os.getenv('AI_REVIEW_FAIL_FAST', 'false').lower() in {'1','true','yes'}
@@ -481,15 +311,12 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Do not post comments; just log intended actions')
     args = parser.parse_args()
     ensure_env()
-    if OpenAI is None:
-        logger.error("openai library (>=1.x) not installed. Please add 'openai' to requirements.")
+    # Initialize OpenAI client via helper (validates env vars)
+    try:
+        client, model_name = create_openai_client()
+    except Exception as e:
+        logger.error("Failed to initialize OpenAI client: %s", e)
         sys.exit(2)
-    api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        logger.error("OPENAI_API_KEY not set")
-        sys.exit(2)
-    client = OpenAI(api_key=api_key)
-    model_name = os.getenv('OPENAI_MODEL')
     pr_source_sha, pr_target_sha = get_pr_commits()
     logger.info("PR source (head) commit: %s Target (base) commit: %s", pr_source_sha[:8], pr_target_sha[:8])
     files = get_pr_changed_files(pr_source_sha, pr_target_sha)
