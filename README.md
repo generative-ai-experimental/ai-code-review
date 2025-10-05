@@ -28,6 +28,7 @@ The script `review/review_azure_devops.py` performs automated line-level review 
 * Markdown-aware mode: for `.md` files the AI focuses on grammar, clarity, tone, and formatting suggestions only
 * C code awareness: for `.c` / `.h` files emphasizes MISRA C guideline adherence, memory safety, undefined behavior, concurrency/race risks, security vulnerabilities, and obvious typos in comments/identifiers (with severity tagging)
 * Aggregated severity summary: posts a final PR-level comment with counts per severity (can disable via `AI_REVIEW_SUMMARY=false`)
+* Explicit configuration object (`DevOpsConfig`) for testability and reduced global state coupling (new)
 
 ### Environment Variables
 Set the following in your pipeline or local shell:
@@ -53,6 +54,62 @@ AI_REVIEW_FAIL_FAST      # true/1 to abort entire run on first file error
 AI_REVIEW_DIFF_MODE      # two-dot (default) or triple-dot
 AI_REVIEW_SUMMARY        # true/false (default true) to enable final severity summary comment
 ```
+
+### Configuration Refactor (DevOpsConfig)
+
+The Azure DevOps helper module (`review/azure_devops_api.py`) now supports an immutable configuration object `DevOpsConfig`.
+
+Why this matters:
+* Eliminates hidden mutable global state
+* Enables easier unit testing (you can construct a config directly)
+* Allows future injection of session objects, custom API versions, or multi-PR batch operations
+
+Two ways to obtain configuration:
+1. Preferred: `cfg = load_config(verify=True)` – validates env and returns a `DevOpsConfig` without mutating globals (unless you then call `ensure_env`).
+2. Legacy-compatible: `cfg = ensure_env(verify=True)` – builds the same config and also updates legacy module-level globals for existing code.
+
+### Usage Examples
+
+Legacy style (still works):
+```python
+from review.azure_devops_api import ensure_env, get_pr_commits, get_pr_changed_files
+
+ensure_env(verify=True)
+src_sha, tgt_sha = get_pr_commits()
+files = get_pr_changed_files(src_sha, tgt_sha)
+```
+
+Preferred explicit style:
+```python
+from review.azure_devops_api import load_config, get_pr_commits, get_pr_changed_files
+
+cfg = load_config(verify=True)
+src_sha, tgt_sha = get_pr_commits(config=cfg)
+files = get_pr_changed_files(src_sha, tgt_sha, config=cfg)
+```
+
+Posting a comment with explicit config:
+```python
+from review.azure_devops_api import post_review_comment
+post_review_comment("src/main.c", "Consider checking return value.", line=42, config=cfg)
+```
+
+Closing outdated AI threads while supplying the config:
+```python
+from review.azure_devops_api import close_outdated_ai_threads, fetch_existing_threads
+threads = fetch_existing_threads(config=cfg)
+# ...derive ai_threads + current_added_lines...
+close_outdated_ai_threads(ai_threads, current_added_lines, config=cfg)
+```
+
+### Migration Guidance
+You can migrate incrementally:
+1. Start calling `load_config()` and threading the `config=` parameter into functions in new code paths.
+2. Leave older code calling `ensure_env()` untouched until convenient to refactor.
+3. Once all callers are explicit, you can remove uses of `ensure_env()` (future release may deprecate globals).
+
+### Deprecation Notice (Planned)
+Global implicit state (module-level `AZURE_DEVOPS_*` variables) is slated for deprecation in a future cleanup release. A warning will precede removal. Adopt the explicit `DevOpsConfig` pattern to future‑proof your integrations.
 
 ### Local Dry Run
 ```
@@ -97,6 +154,10 @@ Copy one of these to the repo root as `azure-pipelines.yml` or reference them vi
 * Could add support for markdown summary comment.
 * Potential enhancement: semantic filtering of unchanged context.
 * Add unit tests for diff parsing logic.
+* Pagination for large thread/diff responses.
+* Inject `requests.Session` for connection reuse & performance.
+* Config-driven retry/backoff policy (currently per-call parameters).
+* Deprecate legacy global environment usage path fully.
 
 ---
 Generated and maintained by an automated assistant.

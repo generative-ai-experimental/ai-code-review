@@ -20,6 +20,7 @@ from .azure_devops_api import (
     post_review_comment,
     close_outdated_ai_threads,
     AI_COMMENT_TAG,
+    MissingEnvironmentError,
 )
 
 MAX_FILE_BYTES = 60_000  # guard against very large files
@@ -310,7 +311,11 @@ def main():
     parser = argparse.ArgumentParser(description="AI code review for Azure DevOps PR")
     parser.add_argument('--dry-run', action='store_true', help='Do not post comments; just log intended actions')
     args = parser.parse_args()
-    ensure_env()
+    try:
+        ensure_env()
+    except MissingEnvironmentError as e:
+        logger.error("Environment validation failed: %s", e)
+        sys.exit(2)
     # Initialize OpenAI client via helper (validates env vars)
     try:
         client, model_name = create_openai_client()
