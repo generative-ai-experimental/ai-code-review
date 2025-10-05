@@ -35,40 +35,55 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger("ai_code_review")
 
 
-def create_openai_client() -> Tuple["OpenAI", str]:  # type: ignore[name-defined]
+def create_openai_client(api_key: Optional[str] = None,
+                         model: Optional[str] = None) -> Tuple["OpenAI", str]:  # type: ignore[name-defined]
     """Initialize OpenAI client and return (client, model_name).
 
-    Environment variables:
-      OPENAI_API_KEY (required)
-      OPENAI_MODEL   (required)
+    Precedence:
+      1. Explicit function arguments (api_key, model) if provided
+      2. Environment variables OPENAI_API_KEY, OPENAI_MODEL
+
+    Raises RuntimeError if required values are missing.
     """
     if OpenAI is None:
         raise RuntimeError("openai package not installed. Add 'openai' to requirements.txt")
-    api_key = os.getenv('OPENAI_API_KEY')
-    model = os.getenv('OPENAI_MODEL')
+    if api_key is None:
+        api_key = os.getenv('OPENAI_API_KEY')
+    if model is None:
+        model = os.getenv('OPENAI_MODEL')
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set")
+        raise RuntimeError("OPENAI_API_KEY not provided (param or env)")
     if not model:
-        raise RuntimeError("OPENAI_MODEL not set")
+        raise RuntimeError("OPENAI_MODEL not provided (param or env)")
     client = OpenAI(api_key=api_key)
     return client, model  # type: ignore
 
 
-def openai_review(client, model: str, prompt: str) -> str:
-    """Execute a chat completion with retry, exponential backoff, fallback model, jitter.
+def openai_review(
+        client,
+        model: str,
+        prompt: str,
+        *,
+        max_retries: int = 5,
+        base_delay: float = 1.0,
+        jitter_cap: float = 0.25,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+        system_prompt: str = "You are a precise senior code reviewer.",
+) -> str:
+    """Execute a chat completion with retry, exponential backoff, jitter.
 
-    Optional environment variables:
-      OPENAI_MAX_RETRIES
-      OPENAI_BASE_DELAY
-      OPENAI_FALLBACK_MODEL
-      OPENAI_RETRY_JITTER
+    Parameters:
+      client: OpenAI client instance
+      model: model/deployment name
+      prompt: user prompt text
+      max_retries: maximum retry attempts for transient errors (default 5)
+      base_delay: base delay (seconds) for exponential backoff (default 1.0)
+      jitter_cap: maximum random jitter added to delay (seconds) (default 0.25)
+      temperature: sampling temperature (default 0.2)
+      max_tokens: max tokens for the completion (default 900)
+      system_prompt: system role content
     """
-    max_retries = int(os.getenv('OPENAI_MAX_RETRIES', '5'))
-    base_delay = float(os.getenv('OPENAI_BASE_DELAY', '1.0'))
-    fallback_model = os.getenv('OPENAI_FALLBACK_MODEL')
-    jitter_cap = float(os.getenv('OPENAI_RETRY_JITTER', '0.25'))
-    using_fallback = False
-
     def should_retry(status_code: Optional[int]) -> bool:
         if status_code is None:
             return True
@@ -79,11 +94,11 @@ def openai_review(client, model: str, prompt: str) -> str:
             completion = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "You are a precise senior code reviewer."},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2,
-                max_tokens=900
+                temperature=temperature,
+                max_tokens=max_tokens
             )
             return completion.choices[0].message.content.strip()
         except Exception as e:  # pragma: no cover
@@ -100,11 +115,6 @@ def openai_review(client, model: str, prompt: str) -> str:
             if not should_retry(status_code):
                 raise RuntimeError(f"Non-retriable OpenAI error (status={status_code}): {e}")
 
-            if attempt == (max_retries // 2) and fallback_model and not using_fallback:
-                logger.warning("Switching to fallback model '%s' after %d failed attempts of '%s'", fallback_model, attempt, model)
-                model = fallback_model  # type: ignore
-                using_fallback = True
-
             if attempt == max_retries:
                 raise RuntimeError(f"OpenAI chat completion failed after {max_retries} retries: {e}")
 
@@ -117,7 +127,7 @@ def openai_review(client, model: str, prompt: str) -> str:
                 delay = base_delay * (2 ** (attempt - 1))
             delay += random.uniform(0, jitter_cap)
             logger.warning(
-                "OpenAI request failed (attempt %d/%d, status=%s, fallback=%s): %s; retrying in %.2fs",
-                attempt, max_retries, status_code, using_fallback, e, delay
+                "OpenAI request failed (attempt %d/%d, status=%s): %s; retrying in %.2fs",
+                attempt, max_retries, status_code, e, delay
             )
             time.sleep(delay)
