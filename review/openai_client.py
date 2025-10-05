@@ -26,14 +26,9 @@ import time
 import random
 import logging
 from typing import Optional, Tuple
-
-try:
-    from openai import OpenAI  # type: ignore
-except ImportError:  # pragma: no cover
-    OpenAI = None  # type: ignore
+from openai import OpenAI
 
 logger = logging.getLogger("ai_code_review")
-
 
 def create_openai_client(api_key: Optional[str] = None,
                          model: Optional[str] = None) -> Tuple["OpenAI", str]:  # type: ignore[name-defined]
